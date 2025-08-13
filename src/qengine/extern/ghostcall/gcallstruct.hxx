@@ -1,4 +1,4 @@
-﻿/*
+/*
 	ghostcall Provides a Level of Indirection for Function Calls, Allowing for Discrete && Hard-to-Trace Function Calls, with all the Obfuscation Necessary Provided by C++20 Codebase and your Choice of Compiler -
     No VMProtect or Third-Party bin2bin Obfuscator Required. 
 	ghostcall Essentially Calls a Dummy Function Pointer, which Triggers a Windows SEH VEH Handler, which then Redirects the Execution to the True Callee Function, making the True Callee Unknown to any Reverse Engineer
@@ -99,7 +99,7 @@ namespace ghostapi {
 
 #pragma region Thread-safe UserAPI Function Wrapper
 
-    std::mutex ghostmut_thrsafe_userapi_mtx;
+    inline std::mutex ghostmut_thrsafe_userapi_mtx;
 
     /*
         This Creates a Thread-Safe UserAPI Call, which can be used to call any Function specified for Usage by the ghostmut API (Use this Function to Invoke the Target Function for EACH CALL in your Application)
@@ -180,7 +180,7 @@ namespace ghostcall {
         __VA_ARGS__))
 
         template<typename T, typename... args>
-        static inline volatile T __stdcall ghostcall_invoke(
+        static inline std::enable_if_t<!std::is_void_v<T>, T> __stdcall ghostcall_invoke(
 
             volatile void*          abs,
 
@@ -232,7 +232,7 @@ else {\
             MAKERD32();
 #endif
 
-			GHOST_EXPAND_GETADDR(insn_addr);
+            GHOST_EXPAND_GETADDR(insn_addr);
 
 #undef GHOST_EXPAND_GETADDR
 
@@ -287,6 +287,110 @@ else {\
             return rcode.get();
         }
 
+        template<typename T, typename... args>
+        static inline std::enable_if_t<std::is_void_v<T>, void> __stdcall ghostcall_invoke(
+
+            volatile void*          abs,
+
+            const callconvention_t  convention,
+
+            args...                 arguments
+
+        ) noexcept {
+
+            std::lock_guard<std::mutex> ghostapi_lock(ghostapi::interrupt_interlock_mtx);
+
+            std::lock_guard<std::recursive_mutex> interr_lock(g_ghostcall_interrupt_mtx);
+
+#pragma region Call Spoof Setup
+
+#pragma region Address Resolution Macro
+            
+#define GHOST_EXPAND_GETADDR(ADDR) \
+if (!g_ghostcall_mode.get()) {\
+        ADDR = (volatile void*)cmut<std::uintptr_t>(\
+            (std::uintptr_t)(new std::uint8_t(\
+                cmut<std::uint8_t>(INT3).get()))\
+        ).get();\
+}\
+else {\
+    while (true) {\
+        bool is_used_region = false;\
+        std::uintptr_t region_start = NULL;\
+        const auto& region = qengine::qmorph::qdisasm::interrupt_mappings()[r() % qengine::qmorph::qdisasm::interrupt_mappings().size()];\
+        for (std::size_t i = 0; i < ghostapi::g_ghostapi_pad_abs.size(); ++i)\
+            if (ghostapi::g_ghostapi_pad_abs[i] == (std::uintptr_t)region.region_address)\
+                is_used_region = true;\
+        if (!is_used_region) {\
+            ghostapi::g_ghostapi_pad_abs.push_back(region_start = (std::uintptr_t)region.region_address);\
+            ADDR = static_cast<volatile void*>(\
+                reinterpret_cast<volatile std::uint8_t*>(region.region_address) + (r() % region.region_length));\
+            break;\
+        }\
+    }\
+}
+
+#pragma endregion
+
+            volatile void* insn_addr = nullptr;
+
+#ifdef _M_X64
+            MAKERD64();
+#else
+            MAKERD32();
+#endif
+
+            GHOST_EXPAND_GETADDR(insn_addr);
+
+#undef GHOST_EXPAND_GETADDR
+
+            DWORD x_perms = NULL;
+
+            if (!virtualprotect_rtImp_inst((void*)insn_addr, sizeof(std::uint8_t), PAGE_EXECUTE_READWRITE, &x_perms))
+                return;
+
+            g_ghostcall_backup_u8 = reinterpret_cast<volatile std::uint8_t*>(insn_addr)[0];
+
+            reinterpret_cast<volatile std::uint8_t*>(insn_addr)[0] = INT3;
+
+            ghostcall::gstruct::ghostcall_true_callee = ~(reinterpret_cast<std::uintptr_t>(abs));
+
+            ghostcall::gstruct::is_ghostcall_breakpoint = true;
+
+#pragma endregion
+
+            switch (convention) {
+
+                case _STDCALL:
+                    reinterpret_cast<void(__stdcall*)(args...)>(const_cast<void*>(insn_addr))(arguments...);
+                    break;
+                case _CDECL:
+                    reinterpret_cast<void(__cdecl*)(args...)>(const_cast<void*>(insn_addr))(arguments...);
+                    break;
+                case _FASTCALL:
+                    reinterpret_cast<void(__fastcall*)(args...)>(const_cast<void*>(insn_addr))(arguments...);
+                    break;
+                default:
+                    return;
+            }
+
+            reinterpret_cast<volatile std::uint8_t*>(insn_addr)[0] = g_ghostcall_backup_u8;
+
+            FlushInstructionCache(GetCurrentProcess(), (void*)insn_addr, sizeof(std::uint8_t));
+
+            if (!VirtualProtect((void*)insn_addr, sizeof(std::uint8_t), x_perms, &x_perms))
+                return;
+
+            x_perms = NULL;
+
+            is_ghostcall_breakpoint = cmut<bool>(false).get();
+
+            if (g_ghostcall_mode.get())
+                ghostapi::g_ghostapi_pad_abs.pop_back();
+            else
+                delete insn_addr;
+        }
+
         /*
 			Use this Function if you wish to Specify a Windows API / User API Function to Call, instead of a Ghostcall Function Pointer; 
 
@@ -296,15 +400,15 @@ else {\
 			If suspend_else_threads Fails to Solve the Problem - Create a Singleton Mutex and Wrap all Calls to the Target WINAPI Function in a Mutex Lock Guard (Which you Obviously lock before Calling this as well)
         */
         template<typename T, typename... args>
-        static inline volatile T __stdcall ghostcall_invoke_userapi(
+        static inline std::enable_if_t<!std::is_void_v<T>, T> __stdcall ghostcall_invoke_userapi(
 
             volatile void*          abs,
 
             const callconvention_t  convention,
 
-			volatile void*          userapi_fn,
+            volatile void*          userapi_fn,
 
-			const bool 			    suspend_else_threads,
+            const bool 			    suspend_else_threads,
 
             args...                 arguments
 
@@ -378,6 +482,87 @@ else {\
             is_ghostcall_breakpoint = cmut<bool>(false).get();
 
             return rcode.get();
+        }
+
+        template<typename T, typename... args>
+        static inline std::enable_if_t<std::is_void_v<T>, void> __stdcall ghostcall_invoke_userapi(
+
+            volatile void*          abs,
+
+            const callconvention_t  convention,
+
+            volatile void*          userapi_fn,
+
+            const bool 			    suspend_else_threads,
+
+            args...                 arguments
+
+        ) noexcept {
+
+#pragma region Prologue / Mutex Guard
+
+#ifdef USE_THREADSAFE_USERAPI_MTX
+
+			std::lock_guard<std::mutex> lock(ghostapi::ghostmut_thrsafe_userapi_mtx);
+
+#endif
+
+            std::lock_guard<std::recursive_mutex> interr_lock(g_ghostcall_interrupt_mtx);
+
+            if (suspend_else_threads) {
+
+                std::lock_guard<std::mutex> thr_lock(ghostapi::proc32_mtx);
+
+                ghostapi::suspend_all_else();
+            }
+
+#pragma endregion
+
+#pragma region UserAPI Call Spoof Setup
+
+            DWORD x_perms = NULL;
+
+            if (!virtualprotect_rtImp_inst((void*)userapi_fn, sizeof(std::uint8_t), PAGE_EXECUTE_READWRITE, &x_perms))
+                return;
+
+            g_ghostcall_backup_u8 = reinterpret_cast<volatile std::uint8_t*>(userapi_fn)[0];
+
+            reinterpret_cast<volatile std::uint8_t*>(userapi_fn)[0] = INT3;
+
+            ghostcall::gstruct::ghostcall_true_callee = ~(reinterpret_cast<std::uintptr_t>(abs));
+
+            ghostcall::gstruct::is_ghostcall_breakpoint = true;
+
+#pragma endregion
+
+            switch (convention) {
+
+                case _STDCALL:
+                    reinterpret_cast<void(__stdcall*)(args...)>(const_cast<void*>(userapi_fn))(arguments...);
+                    break;
+                case _CDECL:
+                    reinterpret_cast<void(__cdecl*)(args...)>(const_cast<void*>(userapi_fn))(arguments...);
+                    break;
+                case _FASTCALL:
+                    reinterpret_cast<void(__fastcall*)(args...)>(const_cast<void*>(userapi_fn))(arguments...);
+                    break;
+                default:
+                    return;
+            }
+
+            reinterpret_cast<volatile std::uint8_t*>(userapi_fn)[0] = g_ghostcall_backup_u8;
+
+            FlushInstructionCache(GetCurrentProcess(), (void*)userapi_fn, sizeof(std::uint8_t));
+
+            if (!virtualprotect_rtImp_inst((void*)userapi_fn, sizeof(std::uint8_t), x_perms, &x_perms))
+                return;
+
+            if (suspend_else_threads)
+                ghostapi::resume_all_else();
+
+            x_perms = NULL;
+
+            is_ghostcall_breakpoint = cmut<bool>(false).get();
         }
 
 #pragma endregion
